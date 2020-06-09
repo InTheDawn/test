@@ -1,0 +1,116 @@
+import org.apache.spark.sql.DataFrame
+import com.zzjz.deepinsight.basic.BaseMain
+import com.zzjz.deepinsight.core.utils.Common._
+import com.zzjz.deepinsight.core.utils.JsonPlus
+import scala.collection.mutable._
+
+import org.apache.spark.sql._
+import org.apache.spark.sql.types._
+import sqlc.implicits._
+
+//接受参数
+val jsonParam = "<#zzjzParam#>"
+//json解析
+val jp = JsonPlus.parse(jsonParam)
+
+//获取数据表名称
+val tableName = jp.inputTable.getString
+
+//获取数据列名称
+val nodeId = jp.nodeId.getString
+val parentNodeId = jp.parentNodeId.getString
+val nodeWeight = jp.nodeWeight.getString
+val lon = jp.lon.getString
+val lat = jp.lat.getString
+
+//获取数据集
+val inputDF = try{
+		z.rdd(tableName).asInstanceOf[DataFrame]
+	} catch {
+    //异常处理
+		case e: java.util.NoSuchElementException => throw new Exception(s"表（$tableName）不存在，请检查输入表名")
+	}
+
+//null值转换
+val inputData = inputDF.select(nodeId,parentNodeId,nodeWeight,lon,lat).rdd.map(row => {
+            row.toSeq.map(v =>{
+			if (v == null ) "null" else v.toString
+			}).toArray 
+        }).collect()
+
+val nonleafMap = new mutable.HashMap[String,Array[String]]()
+var flag = false
+var seq:Int = 0
+
+//通过叶子结点数据构建非叶子节点
+for(row <- inputData){
+  try {
+    val num = row(2).toInt
+  } catch {
+    case _: Exception => alert(s"列 $nodeWeight 不能有null值")
+  }
+  
+  if(row(2).toInt > 0){ //叶子结点
+  	if(row(3) != "null" && row(4) != "null"){
+  		flag = true
+  		updateParent(row,row(2).toInt)
+  	}
+  }else{ //非叶子节点
+    if(nonleafMap.contains(row(0))){  //需要累加seq 改变parentNodeId
+      val newArray = nonleafMap.get(row(0)).get
+      newArray(0) = seq.toString
+      newArray(1) = row(1)
+      nonleafMap += (row(0) -> newArray)
+	  
+    }else{
+      nonleafMap += (row(0) -> Array(seq.toString,row(1),row(2),row(3),row(4)))
+    }
+  }
+  seq += 1
+}
+
+def updateParent(row: Array[String],change: Int): Unit = {
+  if(nonleafMap.contains(row(1))){
+    val newArray = nonleafMap.get(row(1)).get
+  	if(newArray(2) == "null") newArray(2) = "0"
+    if(row(2).toInt > newArray(2).toInt){ //经纬度重新赋值
+      newArray(2) = (newArray(2).toInt + change).toString
+      newArray(3) = row(3)
+      newArray(4) = row(4)
+
+      nonleafMap += (row(1) -> newArray) //添加至集合中
+      if(newArray(1)!= "null" ){updateParent(newArray,change)}
+    }
+  }else{
+    val newArray = Array(seq.toString,row(1),row(2),row(3),row(4))
+    nonleafMap += (row(1) -> newArray)//add
+	
+    if(newArray(1)!= "null" ){updateParent(newArray,row(2).toInt)}
+  }
+}
+
+for((k,v)<-nonleafMap){
+  //leafData(v(0).toInt)(2) = v(2)  //if need to update nodeWeight to sourcedata
+  if(inputData(v(0).toInt)(3) == "null" || inputData(v(0).toInt)(4) == "null"){
+    inputData(v(0).toInt)(3) = v(3)   //write back to inputData
+    inputData(v(0).toInt)(4) = v(4)
+  }
+}
+
+//val rowRdd = sc.makeRDD(Row(inputData(0),inputData.tail:_*))
+val rowRdd = sc.makeRDD(inputData)
+val schema = StructType(
+		Array(
+			StructField("nodeId",StringType,true),
+			StructField("parentNodeId",StringType,true),
+			StructField("nodeWeight",StringType,true),
+			StructField("lon",StringType,true),
+			StructField("lat",StringType,true)
+		)
+	)
+val sourcedf = sqlc.createDataFrame(rowRdd.map(Row.fromSeq(_)),schema)
+var outputdf = sourcedf.select("nodeId","lon","lat")
+outputdf = castTypeOfDF(outputdf, "lon", DoubleType)
+outputdf = castTypeOfDF(outputdf, "lat", DoubleType)
+outputrdd.put("<#rddtablename#>", outputdf)
+outputdf.registerTempTable("<#rddtablename#>")
